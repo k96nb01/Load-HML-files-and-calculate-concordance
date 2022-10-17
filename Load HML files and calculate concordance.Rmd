@@ -1,0 +1,191 @@
+bin---
+title: "SOT patients-donors with NGS typing"
+output: html_notebook
+---
+```{r}
+#Loading libraries. 
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(xml2)
+```
+# Load the high-res results from various programs.
+```{r}
+# Load TruSight results from NGSengine
+
+# Load the HML file here
+HML <- read_xml("NGS_low_res_TruSight_NGSengine.hml")
+
+# This filters for all of the children in the HML file that represent sample data
+samples <-  HML   %>% 
+   xml_find_all( ".//d1:sample")
+
+# This is a custom function to get the sample number and the glstrings for each sample
+dfs <- lapply(samples, function(node){
+   #get sample ID 
+   sampleID <- node %>% xml_attr("id")
+   #get glstrings 
+   glstring <- node %>%  xml_find_all( ".//d1:glstring")  %>% xml_text()
+   #combine to a tibble
+   tibble(sampleID, glstring)
+})
+
+# This creates a table of the typing for each sample
+(typing <-bind_rows(dfs)
+  %>% mutate(locus = str_extract(glstring, "(?<=HLA-)[:alnum:]+"))
+  %>% pivot_wider(names_from = locus, values_from = glstring)
+  # Just keep the sample number for each sample
+  %>% mutate(sampleID = str_extract(sampleID, "[:digit:]+-[:digit:]+"))
+  # Reorder the columns
+  %>% select(sampleID, A, B, C, DRB1, DRB3, DRB4, DRB5, DQA1, DQB1, DPA1, DPB1)
+  # Separate the two typings (separated by "+" in the glstring) into two columns
+  %>% separate(A, sep = "\\+", into = c("A.1", "A.2"), fill = "right")
+  %>% separate(B, sep = "\\+", into = c("B.1", "B.2"), fill = "right")
+  %>% separate(C, sep = "\\+", into = c("C.1", "C.2"), fill = "right")
+  %>% separate(DRB1, sep = "\\+", into = c("DRB1.1", "DRB1.2"), fill = "right")
+  %>% separate(DRB3, sep = "\\+", into = c("DRB3.1", "DRB3.2"), fill = "right")
+  %>% separate(DRB4, sep = "\\+", into = c("DRB4.1", "DRB4.2"), fill = "right")
+  %>% separate(DRB5, sep = "\\+", into = c("DRB5.1", "DRB5.2"), fill = "right")
+  %>% separate(DQA1, sep = "\\+", into = c("DQA1.1", "DQA1.2"), fill = "right")
+  %>% separate(DQB1, sep = "\\+", into = c("DQB1.1", "DQB1.2"), fill = "right")
+  %>% separate(DPA1, sep = "\\+", into = c("DPA1.1", "DPA1.2"), fill = "right")
+  %>% separate(DPB1, sep = "\\+", into = c("DPB1.1", "DPB1.2"), fill = "right")
+  # Remove the 3rd and/or 4th fields if present, keeping any modifiers at the end. This is done in two steps to properly deal with alleles that are reported either to the 3rd or 4th field.
+  %>% mutate(across(2:23, ~str_replace(., "(?<=[:digit:]{2,4}:[:digit:]{2,4}):[:digit:]{2,4}", "")))
+  %>% mutate(across(2:23, ~str_replace(., "(?<=[:digit:]{2,4}:[:digit:]{2,4}):[:digit:]{2,4}", "")))
+  # Keep the first allele (ambiguities are separated by "\", and alternatives by "|" in the glstring)
+  %>% mutate(across(2:23, ~str_extract(., "[^/|]+")))
+  # Keep only "N" modifiers at the end.
+  %>% mutate(across(2:23, ~str_extract(., "HLA-[:alnum:]+\\*[:digit:]+:[:digit:]+N?")))
+ )
+
+#Assign a name to the final typing table
+(TruSight_NGSengine <- typing)
+```
+
+```{r}
+#Load TruSight results from HLA-HD
+
+(TruSight_HLAHD <- read_csv("HLA-HD_TruSight.csv", col_select = 1:45)
+ %>% rename(Sample_number = patientID)
+ %>% select(-contains("Reads"))
+ # Remove the 3rd and/or 4th fields if present, keeping any modifiers at the end. This is done in two steps to properly deal with alleles that are reported either to the 3rd or 4th field.
+  %>% mutate(across(2:23, ~str_replace(., "(?<=[:digit:]{2,4}:[:digit:]{2,4}):[:digit:]{2,4}", "")))
+  %>% mutate(across(2:23, ~str_replace(., "(?<=[:digit:]{2,4}:[:digit:]{2,4}):[:digit:]{2,4}", "")))
+ # Replace "-" with "NA" for no typing at an allele or locus.
+ %>% mutate(across(2:23, ~na_if(., "-")))
+ %>% mutate(across(2:23, ~na_if(., "Not typed")))
+)
+```
+
+```{r}
+# Compare NGSengine to HLA-HD results for TruSight files
+
+# Create a function to determine if typing at a locus is concordant between two assays. It is assumed that an "NA" value at the either allele indicates a homozygous typing at that locus, so the function copies the typing to the other allele to ensure accurate results. If no typing (NA) is present in either allele, it is assumed that no alleles were detected at that locus. The function requires "blank" results to be recorded as "NA," so any other way of recording blank results (e.g. "blank" or "-") needs to be converted to "NA."
+
+# The typing_concordance function arguments are assay X allele 1 (x.1), assay X allele 2 (x.2), assay Y allele 1 (y.1), assay Y allele 2 (y.2).
+
+typing_concordance <- function(x.1, x.2, y.1, y.2, concordance = "concordant", discordance = "discordant") {
+  # Homozygous (or hemizygous in the case of DRB3/4/5) alleles can show up as either the same result in both alleles, or one allele as blank (NA). This fills in any "NA" values by copying the value from the other allele.
+  X.1 <- coalesce(x.1, x.2)
+  X.2 <- coalesce(x.2, X.1)
+  Y.1 <- coalesce(y.1, y.2)
+  Y.2 <- coalesce(y.2, Y.1)
+  
+  # To ensure the output is "concordant" for loci with no detected alleles (NA after the steps above), there needs to be a placeholder value, as the code below won't work on "NA" values.
+  X.1 <- if_else(is.na(X.1), "blank", as.character(X.1))
+  X.2 <- if_else(is.na(X.2), "blank", as.character(X.2))
+  Y.1 <- if_else(is.na(Y.1), "blank", as.character(Y.1))
+  Y.2 <- if_else(is.na(Y.2), "blank", as.character(Y.2))
+  
+  # The corrected typing at each allele is now compared to see if that allele was found in either of the positions of the other assay.
+  A <- (X.1 == Y.1 | X.1 == Y.2)
+  B <- (X.2 == Y.1 | X.2 == Y.2)
+  C <- (Y.1 == X.1 | Y.1 == X.2)
+  D <- (Y.2 == X.1 | Y.2 == X.2)
+  
+  # Only if all 4 alleles were found in the other assay will the result be "concordant."
+  if_else(A == TRUE & B == TRUE & C == TRUE & D == TRUE, {concordance}, {discordance})
+}
+
+(A_discordant <- TruSight_concordance 
+  %>% filter(A_match == "discordant") 
+  %>% select(sampleID, A.1, A.2, A_Allele_1, A_Allele_2, A_match)
+  %>% rename_with(~ str_replace(. , "A\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "A_", "HLA_HD_"))
+  )
+
+(B_discordant <- TruSight_concordance 
+  %>% filter(B_match == "discordant") 
+  %>% select(sampleID, B.1, B.2, B_Allele_1, B_Allele_2, B_match)
+  %>% rename_with(~ str_replace(. , "B\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "B_", "HLA_HD_"))
+  )
+
+(C_discordant <- TruSight_concordance 
+  %>% filter(C_match == "discordant") 
+  %>% select(sampleID, C.1, C.2, C_Allele_1, C_Allele_2, C_match)
+  %>% rename_with(~ str_replace(. , "C\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "C_", "HLA_HD_"))
+  )
+
+(DRB1_discordant <- TruSight_concordance 
+  %>% filter(DRB1_match == "discordant") 
+  %>% select(sampleID, DRB1.1, DRB1.2, DRB1_Allele_1, DRB1_Allele_2, DRB1_match)
+  %>% rename_with(~ str_replace(. , "DRB1\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DRB1_", "HLA_HD_"))
+  )
+
+(DRB3_discordant <- TruSight_concordance 
+  %>% filter(DRB3_match == "discordant") 
+  %>% select(sampleID, DRB3.1, DRB3.2, DRB3_Allele_1, DRB3_Allele_2, DRB3_match)
+  %>% rename_with(~ str_replace(. , "DRB3\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DRB3_", "HLA_HD_"))
+  )
+
+(DRB4_discordant <- TruSight_concordance 
+  %>% filter(DRB4_match == "discordant") 
+  %>% select(sampleID, DRB4.1, DRB4.2, DRB4_Allele_1, DRB4_Allele_2, DRB4_match)
+  %>% rename_with(~ str_replace(. , "DRB4\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DRB4_", "HLA_HD_"))
+  )
+
+(DRB5_discordant <- TruSight_concordance 
+  %>% filter(DRB5_match == "discordant") 
+  %>% select(sampleID, DRB5.1, DRB5.2, DRB5_Allele_1, DRB5_Allele_2, DRB5_match)
+  %>% rename_with(~ str_replace(. , "DRB5\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DRB5_", "HLA_HD_"))
+  )
+
+(DQA1_discordant <- TruSight_concordance 
+  %>% filter(DQA1_match == "discordant") 
+  %>% select(sampleID, DQA1.1, DQA1.2, DQA1_Allele_1, DQA1_Allele_2, DQA1_match)
+  %>% rename_with(~ str_replace(. , "DQA1\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DQA1_", "HLA_HD_"))
+  )
+
+(DQB1_discordant <- TruSight_concordance 
+  %>% filter(DQB1_match == "discordant") 
+  %>% select(sampleID, DQB1.1, DQB1.2, DQB1_Allele_1, DQB1_Allele_2, DQB1_match)
+  %>% rename_with(~ str_replace(. , "DQB1\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DQB1_", "HLA_HD_"))
+  )
+
+(DPA1_discordant <- TruSight_concordance 
+  %>% filter(DPA1_match == "discordant") 
+  %>% select(sampleID, DPA1.1, DPA1.2, DPA1_Allele_1, DPA1_Allele_2, DPA1_match)
+  %>% rename_with(~ str_replace(. , "DPA1\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DPA1_", "HLA_HD_"))
+  )
+
+(DPB1_discordant <- TruSight_concordance 
+  %>% filter(DPB1_match == "discordant") 
+  %>% select(sampleID, DPB1.1, DPB1.2, DPB1_Allele_1, DPB1_Allele_2, DPB1_match)
+  %>% rename_with(~ str_replace(. , "DPB1\\.", "NGSengine."))
+  %>% rename_with(~ str_replace(. , "DPB1_", "HLA_HD_"))
+  )
+
+discordant_samples <- bind_rows(A_discordant, B_discordant, C_discordant, DRB1_discordant, DRB3_discordant, DRB4_discordant, DRB5_discordant, DQA1_discordant, DQB1_discordant, DPA1_discordant, DPB1_discordant)
+
+write.xlsx(discordant_samples, "discordant_samples.xlsx")
+```
